@@ -1,0 +1,219 @@
+name: Linux CLI packages (jeff-kunkun/multica v* tags)
+
+# jeff-kunkun/multica's own Actions are disabled, so its `release.yml` never
+# runs GoReleaser and a `v*` tag ships no CLI archive. This job watches the
+# source repository's tags, cross-compiles the Linux CLI/daemon with the
+# source tree's own `.goreleaser.yml` (same names, same ldflags, same
+# checksums.txt) and publishes it to a GitHub Release:
+#
+#   - with the `SOURCE_RELEASE_TOKEN` secret set (a token that can write
+#     Releases on jeff-kunkun/multica): onto the source repository's Release
+#     for that tag, next to the Desktop assets, so `multica update` finds it
+#     without any extra configuration;
+#   - without it: onto this repository's own Release named after the tag.
+#     Servers then upgrade with `MULTICA_RELEASE_REPO=<this repo> multica update`
+#     or the curl line in README.md.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to package (default: newest v* tag)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cli-linux
+  cancel-in-progress: false
+
+env:
+  SOURCE: jeff-kunkun/multica
+  # Linux archives .goreleaser.yml produces; the versioned name is what the
+  # current CLI / install script look for, the legacy name keeps old CLIs'
+  # `multica update` working. checksums.txt is required by `multica update`.
+  ARCHES: amd64 arm64
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
+      target: ${{ steps.target.outputs.repo }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - id: tag
+        name: Pick the source tag
+        run: |
+          set -euo pipefail
+          want='${{ inputs.tag }}'
+          if [ -z "$want" ]; then
+            want=$(git ls-remote --tags --refs "https://github.com/$SOURCE" 'refs/tags/v*' \
+              | cut -f2 | sed 's#refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+              | sort -V | tail -n1)
+          fi
+          [ -n "$want" ] || { echo "no v* tag on $SOURCE"; exit 1; }
+          # Peel annotated tags to the commit they point at.
+          sha=$(git ls-remote "https://github.com/$SOURCE" "refs/tags/$want^{}" "refs/tags/$want" | head -n1 | cut -f1)
+          [ -n "$sha" ] || { echo "tag $want not found on $SOURCE"; exit 1; }
+          echo "tag=$want sha=$sha"
+          echo "tag=$want" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - id: target
+        name: Pick the Release repository
+        env:
+          HAS_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" = "true" ]; then repo="$SOURCE"; else repo='${{ github.repository }}'; fi
+          echo "publishing to $repo"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+      - id: check
+        name: Skip when the Release already has every Linux asset
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET: ${{ steps.target.outputs.repo }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          have=$(gh release view "$TAG" -R "$TARGET" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          build=false
+          for arch in $ARCHES; do
+            for name in "multica-cli-$version-linux-$arch.tar.gz" "multica_linux_$arch.tar.gz"; do
+              grep -qx "$name" <<<"$have" || { echo "missing $name"; build=true; }
+            done
+          done
+          grep -qx checksums.txt <<<"$have" || { echo "missing checksums.txt"; build=true; }
+          echo "$TAG on $TARGET build=$build"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      TARGET: ${{ needs.plan.outputs.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Confirm the checkout is the tagged commit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SHA"
+          test "$(git describe --tags --exact-match)" = "$TAG"
+      - uses: actions/setup-go@v5
+        with:
+          # Same policy as the source's release.yml: newest 1.26 patch.
+          go-version: "1.26.x"
+          check-latest: true
+          cache-dependency-path: server/go.sum
+      - name: Build with the source tree's .goreleaser.yml
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          # Publishing is done below with gh so the target repository can be
+          # chosen at run time; GoReleaser only builds and writes checksums.
+          args: release --clean --skip=publish,announce,validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Collect the Linux assets
+        id: assets
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p out
+          for arch in $ARCHES; do
+            for name in "multica-cli-$version-linux-$arch.tar.gz" "multica_linux_$arch.tar.gz"; do
+              test -f "dist/$name" || { echo "GoReleaser did not produce dist/$name"; ls dist; exit 1; }
+              cp "dist/$name" out/
+            done
+          done
+          # Only the assets uploaded here; `multica update` looks its own
+          # asset name up in this file, extra lines would be noise.
+          grep -E ' (multica-cli-.*-linux-.*\.tar\.gz|multica_linux_.*\.tar\.gz)$' dist/checksums.txt > out/checksums.txt
+          (cd out && sha256sum -c checksums.txt)
+          ls -l out
+      - name: Smoke-test the amd64 binary reports the tag and commit
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tar -xzf "out/multica-cli-$version-linux-amd64.tar.gz" -C out multica
+          out/multica --version | tee version.txt
+          grep -q "$version" version.txt
+          grep -q "commit: ${SHA:0:7}" version.txt
+          rm out/multica
+      - name: Create the Release when it is missing
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$TARGET" >/dev/null 2>&1; then
+            echo "release $TAG exists on $TARGET"; exit 0
+          fi
+          pre=()
+          case "$TAG" in *-*) pre=(--prerelease) ;; esac
+          if [ "$TARGET" = "$SOURCE" ]; then
+            gh release create "$TAG" -R "$TARGET" --verify-tag "${pre[@]}" \
+              --title "Multica $TAG (kun fork)" \
+              --notes "Linux CLI/daemon packages built by https://github.com/${{ github.repository }} from $SOURCE@$SHA."
+          else
+            # This repository has no copy of the source tag; the Release is
+            # just a shelf for the archives, so it hangs off our own default
+            # branch and the notes say which source commit it was built from.
+            # Not a prerelease on purpose: `multica update` reads
+            # /releases/latest, which skips prereleases.
+            gh release create "$TAG" -R "$TARGET" --target "${{ github.sha }}" \
+              --title "Multica CLI $TAG (linux, from $SOURCE)" \
+              --notes "Linux CLI/daemon packages for $SOURCE tag $TAG (commit $SHA), built with that tree's .goreleaser.yml. Upgrade a server with: MULTICA_RELEASE_REPO=${{ github.repository }} multica update"
+          fi
+      - name: Upload the assets
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Archives first, checksums.txt last: `multica update` refuses a
+          # release without the manifest, so a half-finished upload stays
+          # invisible to it instead of pointing at missing files.
+          gh release upload "$TAG" -R "$TARGET" --clobber out/*.tar.gz
+          gh release upload "$TAG" -R "$TARGET" --clobber out/checksums.txt
+      - name: Verify every asset is uploaded with the right size
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$TARGET/releases/tags/$TAG" --jq '.assets[] | "\(.name)\t\(.state)\t\(.size)\t\(.browser_download_url)"' > remote.tsv
+          fail=0
+          for f in out/*; do
+            name=$(basename "$f"); size=$(stat -c %s "$f")
+            line=$(grep -P "^\Q$name\E\t" remote.tsv || true)
+            if [ -z "$line" ]; then echo "MISSING $name"; fail=1; continue; fi
+            state=$(cut -f2 <<<"$line"); rsize=$(cut -f3 <<<"$line"); url=$(cut -f4 <<<"$line")
+            if [ "$state" != uploaded ] || [ "$rsize" != "$size" ]; then
+              echo "BAD $name state=$state size=$rsize want=$size"; fail=1
+            else
+              echo "ok  $name $size $url"
+            fi
+          done
+          exit $fail
+      - name: Summary
+        run: |
+          {
+            echo "## Linux CLI $TAG"
+            echo
+            echo "- source: \`$SOURCE@$SHA\`"
+            echo "- release: https://github.com/$TARGET/releases/tag/$TAG"
+            echo '- `multica --version`:'
+            echo
+            echo '```'; cat version.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
