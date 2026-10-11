@@ -59,7 +59,9 @@ jobs:
           fi
           [ -n "$want" ] || { echo "no v* tag on $SOURCE"; exit 1; }
           # Peel annotated tags to the commit they point at.
-          sha=$(git ls-remote "https://github.com/$SOURCE" "refs/tags/$want^{}" "refs/tags/$want" | head -n1 | cut -f1)
+          refs=$(git ls-remote "https://github.com/$SOURCE" "refs/tags/$want" "refs/tags/$want^{}")
+          sha=$(grep -F "refs/tags/$want^{}" <<<"$refs" | cut -f1)
+          [ -n "$sha" ] || sha=$(grep -F "refs/tags/$want" <<<"$refs" | cut -f1)
           [ -n "$sha" ] || { echo "tag $want not found on $SOURCE"; exit 1; }
           echo "tag=$want sha=$sha"
           echo "tag=$want" >> "$GITHUB_OUTPUT"
