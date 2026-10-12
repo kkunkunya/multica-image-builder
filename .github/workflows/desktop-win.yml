@@ -1,0 +1,138 @@
+name: Windows Desktop installer (jeff-kunkun/multica v* tags)
+
+# jeff-kunkun/multica's own Actions are disabled, so its Desktop Release
+# workflow never runs. This job builds only the Windows installers from a source
+# tag (same scripts/package.mjs as the source workflow's Windows job, so the
+# version is stamped from the tag and the bundled CLI is built for each arch) and
+# publishes them on a Release of THIS repository named windows-<tag>. It never
+# writes to the source repository, so macOS/Linux assets there are untouched.
+# Not marked "latest" on purpose: `MULTICA_RELEASE_REPO=<this repo> multica update`
+# reads /releases/latest and must keep finding the Linux CLI archives.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to package, e.g. v0.6.3"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-win-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE: jeff-kunkun/multica
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - name: Check the tag shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad tag '$TAG'"; exit 1; }
+          [[ "$TAG" != *-dirty* ]] || { echo "refusing dirty tag"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Record the build commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git describe --tags --exact-match)" = "$TAG"
+          echo "build commit: $(git rev-parse HEAD) ($TAG)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Package Desktop for Windows (x64, arm64)
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset CSC_LINK CSC_KEY_PASSWORD
+          export CSC_IDENTITY_AUTO_DISCOVERY=false
+          node scripts/package.mjs --win --x64 --arm64 --publish never
+          ls -l dist
+      - name: Collect assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir out
+          cp apps/desktop/dist/multica-desktop-"$version"-windows-*.exe out/
+          cp apps/desktop/dist/multica-desktop-"$version"-windows-*.exe.blockmap out/ 2>/dev/null || true
+          test "$(ls out/*.exe | wc -l)" = 2 || { echo "expected x64 + arm64 installers"; ls -l out; exit 1; }
+          (cd out && sha256sum *.exe > SHA256SUMS-windows.txt && cat SHA256SUMS-windows.txt)
+          ls -l out
+      - name: Smoke-test the x64 installer (silent install, bundled CLI version)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          inst="$PWD/out/multica-desktop-$version-windows-x64.exe"
+          dest="$RUNNER_TEMP/multica-install"
+          mkdir -p "$dest"
+          "$inst" /S "/D=$(cygpath -w "$dest")"
+          for i in $(seq 1 60); do
+            cli=$(find "$dest" -type f -iname multica.exe 2>/dev/null | head -1 || true)
+            [ -n "$cli" ] && break; sleep 2
+          done
+          [ -n "${cli:-}" ] || { echo "multica.exe not found under $dest"; find "$dest" -maxdepth 3 | head -50; exit 1; }
+          echo "cli: $cli"
+          "$cli" --version | tee version.txt
+          grep -q "$version" version.txt
+          grep -q "commit: $(git rev-parse --short=7 HEAD)" version.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"; cat version.txt >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Create the Release when it is missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rel="windows-$TAG"
+          if gh release view "$rel" -R "${{ github.repository }}" >/dev/null 2>&1; then echo "release $rel exists"; exit 0; fi
+          sha=$(git rev-parse HEAD)
+          gh release create "$rel" -R "${{ github.repository }}" --target "${{ github.sha }}" --latest=false \
+            --title "Multica Desktop $TAG (Windows, from $SOURCE)" \
+            --notes "Windows installers (x64, arm64) for $SOURCE tag $TAG (commit $sha). Unsigned: SmartScreen may warn on first run (More info -> Run anyway). Verify with: sha256sum -c SHA256SUMS-windows.txt (or Get-FileHash in PowerShell)."
+      - name: Upload the assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "windows-$TAG" -R "${{ github.repository }}" --clobber out/*.exe out/*.blockmap
+          gh release upload "windows-$TAG" -R "${{ github.repository }}" --clobber out/SHA256SUMS-windows.txt
+      - name: Verify every asset is uploaded and matches the local build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/releases/tags/windows-$TAG" --jq '.assets[] | "\(.name)\t\(.state)\t\(.size)\t\(.browser_download_url)"' > remote.tsv
+          fail=0
+          for f in out/*; do
+            name=$(basename "$f"); size=$(stat -c %s "$f")
+            line=$(grep -P "^\Q$name\E\t" remote.tsv || true)
+            if [ -z "$line" ]; then echo "MISSING $name"; fail=1; continue; fi
+            state=$(cut -f2 <<<"$line"); rsize=$(cut -f3 <<<"$line"); url=$(cut -f4 <<<"$line")
+            if [ "$state" != uploaded ] || [ "$rsize" != "$size" ]; then echo "BAD $name state=$state size=$rsize want=$size"; fail=1
+            else echo "ok  $name $size $url" | tee -a "$GITHUB_STEP_SUMMARY"; fi
+          done
+          exit $fail
