@@ -1,0 +1,93 @@
+name: Mac desktop release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing source test tag, verified before dispatch
+        required: true
+        type: string
+      source_sha:
+        description: Full verified source commit
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: desktop-mac-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    uses: ./.github/workflows/verify-source.yml
+    with:
+      source_ref: ${{ inputs.source_sha }}
+  mac:
+    needs: verify
+    runs-on: macos-14
+    env:
+      TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      TARGET_REPO: ${{ github.repository }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-test\.[0-9]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact source and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git describe --tags --match 'v[0-9]*' --always)" = "$TAG"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Package Apple Silicon installer
+        working-directory: apps/desktop
+        run: node scripts/package.mjs --mac --arm64 --publish never
+      - name: Hash installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/desktop/dist
+          shasum -a 256 *.dmg *.zip > desktop-checksums.txt
+      - name: Preserve build independently of publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-mac-${{ inputs.tag }}
+          path: |
+            apps/desktop/dist/*.dmg
+            apps/desktop/dist/*.zip
+            apps/desktop/dist/*.blockmap
+            apps/desktop/dist/test*.yml
+            apps/desktop/dist/desktop-checksums.txt
+          if-no-files-found: error
+      - name: Create test release and upload products before update manifests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf 'Source: jeff-kunkun/multica@%s\nApple Silicon Mac installer, ad-hoc signed and not notarized. Manual installation required.\n' "$SOURCE_SHA" > /tmp/release-notes.txt
+          if ! gh release view "$TAG" -R "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$TARGET_REPO" --prerelease --title "Multica $TAG" --notes-file /tmp/release-notes.txt
+          fi
+          node scripts/desktop-release-assets.mjs clean --tag "$TAG" --repo "$TARGET_REPO" --dist apps/desktop/dist --scope-dist
+          node scripts/desktop-release-assets.mjs upload --tag "$TAG" --repo "$TARGET_REPO" --dist apps/desktop/dist
+          gh release upload "$TAG" apps/desktop/dist/desktop-checksums.txt -R "$TARGET_REPO" --clobber
+          node scripts/desktop-release-assets.mjs check --tag "$TAG" --repo "$TARGET_REPO" --dist apps/desktop/dist --scope-dist

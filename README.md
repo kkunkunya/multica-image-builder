@@ -56,3 +56,28 @@ multica --version
 Restart the daemon afterwards if one is running (`multica daemon status`).
 When `SOURCE_RELEASE_TOKEN` is set, replace the repository in the URLs above
 with `jeff-kunkun/multica` and drop the `MULTICA_RELEASE_REPO=` prefix.
+
+## Full-version release verification and Mac installer
+
+`verify-source.yml` runs the frontend (including mobile), migration, regular Go
+and agent Go checks on GitHub runners. `workflow_dispatch` accepts an immutable
+source commit or branch; the resolver pins one SHA for every job. Pushes to
+`agent/**` that change these release workflows verify the current `kun` source.
+Tests use UTC and disposable PostgreSQL/Redis services. Do not run release tests
+or screen-based acceptance on Kun's Mac; Kun performs her own installation test.
+
+`desktop-mac.yml` accepts an existing `vX.Y.Z-test.N` source tag and its full
+`source_sha`. All remote verification jobs must pass before packaging. The Mac
+runner verifies that tag, HEAD and the supplied SHA agree, then builds the
+Apple Silicon installer with an ad-hoc signature. No signing keys are needed.
+It preserves an Actions artifact, uploads installers before update manifests,
+and verifies the uploaded assets with the source repository's existing tool.
+`desktop-checksums.txt` supplies SHA256 for the DMG and ZIP.
+
+Mac downloads are on this repository's Release. The application still has its
+existing source-repository update feed, so these downloads require manual
+installation; do not claim the existing automatic updater will discover them.
+Linux packaging keeps its existing destination and schedule. No production
+rollout or database backup is performed by these workflows. Start the exact
+verified images on the designated test server, verify them, then back up the
+production database and follow the production rollback plan before rollout.
