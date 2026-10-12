@@ -90,7 +90,7 @@ jobs:
           mkdir -p "$dest"
           "$inst" /S "/D=$(cygpath -w "$dest")"
           for i in $(seq 1 60); do
-            cli=$(find "$dest" -type f -iname multica.exe 2>/dev/null | head -1 || true)
+            cli=$(find "$dest" -type f -ipath "*/resources/bin/multica.exe" 2>/dev/null | head -1 || true)
             [ -n "$cli" ] && break; sleep 2
           done
           [ -n "${cli:-}" ] || { echo "multica.exe not found under $dest"; find "$dest" -maxdepth 3 | head -50; exit 1; }
