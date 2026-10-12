@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jeff-kunkun/multica
-          ref: ${{ inputs.source_ref || 'kun' }}
+          ref: ${{ inputs.source_ref || 'c89b83905c55f9386ae9e8135cf6c28255842ca2' }}
           persist-credentials: false
       - id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -87,6 +87,34 @@ jobs:
           cache-dependency-path: server/go.sum
       - run: make migration-lint
       - run: cd server && go run ./cmd/migrate up
+      - name: Verify interrupted indexes recover on real PostgreSQL
+        run: |
+          set -o pipefail
+          mkdir -p release-evidence
+          cd server
+          go test -race -v ./cmd/migrate -run '^(TestFastAccessIndexesRecoverAfterInterruptedBuild|TestEveryConcurrentUpBuildHasCleanup)$' 2>&1 | tee ../release-evidence/index-recovery.txt
+      - name: Prove the regression test rejects missing cleanup registrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp server/cmd/migrate/main.go "$RUNNER_TEMP/migrate-main.go"
+          trap 'cp "$RUNNER_TEMP/migrate-main.go" server/cmd/migrate/main.go' EXIT
+          sed -i '/"67[4-7]_fast_access_.*":.*"fast_access_/d' server/cmd/migrate/main.go
+          set +e
+          (cd server && go test -v ./cmd/migrate -run '^TestEveryConcurrentUpBuildHasCleanup$') > release-evidence/without-cleanups.txt 2>&1
+          result=$?
+          set -e
+          cat release-evidence/without-cleanups.txt
+          test "$result" -ne 0
+          grep -q -- '--- FAIL: TestEveryConcurrentUpBuildHasCleanup' release-evidence/without-cleanups.txt
+          cp "$RUNNER_TEMP/migrate-main.go" server/cmd/migrate/main.go
+          git diff --exit-code -- server/cmd/migrate/main.go
+          (cd server && go test -v ./cmd/migrate -run '^TestEveryConcurrentUpBuildHasCleanup$') 2>&1 | tee release-evidence/restored-candidate.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-recovery-evidence
+          path: release-evidence/
       - run: bash scripts/test-go.sh --race --only regular
   agent-tests:
     needs: source
