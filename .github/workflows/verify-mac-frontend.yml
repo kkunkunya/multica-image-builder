@@ -1,0 +1,49 @@
+name: Verify Mac release frontend
+on:
+  push:
+    branches: ['agent/**']
+    paths: ['.github/workflows/verify-mac-frontend.yml']
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ inputs.source_ref || 'dbace0dfa6d6432678e826da1d43550348a18b76' }}
+          persist-credentials: false
+      - id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  frontend:
+    needs: source
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - if: ${{ !cancelled() }}
+        run: pnpm lint
+      - if: ${{ !cancelled() }}
+        run: pnpm test
+      - if: ${{ !cancelled() }}
+        run: pnpm --filter @multica/mobile typecheck
+      - if: ${{ !cancelled() }}
+        run: pnpm --filter @multica/mobile lint
+      - if: ${{ !cancelled() }}
+        run: pnpm --filter @multica/mobile test

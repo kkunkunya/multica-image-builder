@@ -1,0 +1,150 @@
+name: Verify source before release
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source commit or branch to verify
+        default: kun
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+  push:
+    branches: ['agent/**']
+    paths: ['.github/workflows/verify-source.yml', '.github/workflows/desktop-mac.yml']
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ inputs.source_ref || 'd875f5eb2a9bf4879ff55736f967db16432a80ba' }}
+          persist-credentials: false
+      - id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  frontend:
+    needs: source
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      TZ: UTC
+      NODE_OPTIONS: --max-old-space-size=6144
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck --concurrency=1
+      - if: ${{ !cancelled() }}
+        run: pnpm lint --concurrency=1
+      - if: ${{ !cancelled() }}
+        run: pnpm test --concurrency=1
+      - if: ${{ !cancelled() }}
+        run: pnpm --filter @multica/mobile typecheck
+      - if: ${{ !cancelled() }}
+        run: pnpm --filter @multica/mobile lint
+      - if: ${{ !cancelled() }}
+        run: pnpm --filter @multica/mobile test
+  backend:
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: multica
+          POSTGRES_USER: multica
+          POSTGRES_PASSWORD: multica
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U multica -d multica" --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://multica:multica@localhost:5432/multica?sslmode=disable
+      REDIS_TEST_URL: redis://localhost:6379/1
+      GOFLAGS: -count=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: server/go.sum
+      - run: make migration-lint
+      - run: cd server && go run ./cmd/migrate up
+      - name: Confirm migration 680 is applied
+        run: |
+          test "$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM schema_migrations WHERE version = '680_issue_assignee_source_self_claim'")" = 1
+      - name: Verify interrupted indexes recover on real PostgreSQL
+        run: |
+          set -o pipefail
+          mkdir -p release-evidence
+          cd server
+          go test -race -v ./cmd/migrate -run '^(TestFastAccessIndexesRecoverAfterInterruptedBuild|TestEveryConcurrentUpBuildHasCleanup)$' 2>&1 | tee ../release-evidence/index-recovery.txt
+      - name: Prove the regression test rejects missing cleanup registrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp server/cmd/migrate/main.go "$RUNNER_TEMP/migrate-main.go"
+          trap 'cp "$RUNNER_TEMP/migrate-main.go" server/cmd/migrate/main.go' EXIT
+          sed -i '/"67[4-7]_fast_access_.*":.*"fast_access_/d' server/cmd/migrate/main.go
+          set +e
+          (cd server && go test -v ./cmd/migrate -run '^TestEveryConcurrentUpBuildHasCleanup$') > release-evidence/without-cleanups.txt 2>&1
+          result=$?
+          set -e
+          cat release-evidence/without-cleanups.txt
+          test "$result" -ne 0
+          grep -q -- '--- FAIL: TestEveryConcurrentUpBuildHasCleanup' release-evidence/without-cleanups.txt
+          cp "$RUNNER_TEMP/migrate-main.go" server/cmd/migrate/main.go
+          git diff --exit-code -- server/cmd/migrate/main.go
+          (cd server && go test -v ./cmd/migrate -run '^TestEveryConcurrentUpBuildHasCleanup$') 2>&1 | tee release-evidence/restored-candidate.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-recovery-evidence
+          path: release-evidence/
+      - run: bash scripts/test-go.sh --race --only regular
+      - name: Verify generated database code matches SQL
+        if: ${{ !cancelled() }}
+        run: |
+          make sqlc
+          git diff --exit-code -- server/internal/db
+
+  agent-tests:
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GOFLAGS: -count=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jeff-kunkun/multica
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: server/go.sum
+      - run: bash scripts/test-go.sh --race --only agent
