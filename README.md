@@ -8,6 +8,7 @@ GitHub Actions are disabled (since 2026-10-08). Two workflows, both on a
 | --- | --- | --- |
 | `build.yml` | tip of `kun` | `ghcr.io/kkunkunya/multica-{backend,web}:sha-<tip>` self-host images for ai.ferryway.cc. The box pulls them with `MULTICA_AUTOUPDATE_REGISTRY=ghcr.io/kkunkunya` in `/etc/multica/autoupdate.env`. |
 | `cli-linux.yml` | newest `v*` tag | Linux CLI/daemon archives for that tag: `multica-cli-<ver>-linux-{amd64,arm64}.tar.gz`, the legacy `multica_linux_{amd64,arm64}.tar.gz`, and `checksums.txt`, built with the source tree's own `.goreleaser.yml` so names, `--version` and checksums match an official release. |
+| `build-test.yml` | manual only (`-f ref=<branch-or-sha>`) | `ghcr.io/kkunkunya/multica-test-{backend,web}:sha-<sha>` for a throwaway test instance. Separate package names, so no self-host box follows them. |
 
 Once Actions run again on jeff-kunkun/multica, drop that env line on the box
 and delete this repository.
