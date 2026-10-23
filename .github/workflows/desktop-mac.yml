@@ -1,0 +1,144 @@
+name: macOS Desktop installer (jeff-kunkun/multica v* tags)
+
+# jeff-kunkun/multica's own Actions do not run, so its Desktop Release workflow
+# never builds the macOS package. This job builds the Apple Silicon package from
+# a source tag with the same scripts/package.mjs as the source workflow (version
+# stamped from the tag, bundled CLI built for the arch) and publishes it on a
+# Release of THIS repository named mac-<tag>. It never writes to the source
+# repository. The package is ad-hoc signed and not notarized, so macOS blocks the
+# first launch: run `xattr -dr com.apple.quarantine /Applications/Multica.app`.
+# Not marked "latest" on purpose: `MULTICA_RELEASE_REPO=<this repo> multica update`
+# reads /releases/latest and must keep finding the Linux CLI archives.
+# The auto-update feed of an installed app points at the source repository, so
+# this Release is a manual download; the app will not pick it up by itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to package, e.g. v0.6.6-test.1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-mac-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE: jeff-kunkun/multica
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  package:
+    runs-on: macos-14
+    steps:
+      - name: Check the tag shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad tag '$TAG'"; exit 1; }
+          [[ "$TAG" != *-dirty* ]] || { echo "refusing dirty tag"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Record the build commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git describe --tags --exact-match)" = "$TAG"
+          echo "build commit: $(git rev-parse HEAD) ($TAG)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Package Desktop for macOS (arm64, ad-hoc signed)
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset CSC_LINK CSC_KEY_PASSWORD
+          export CSC_IDENTITY_AUTO_DISCOVERY=false
+          node scripts/package.mjs --mac --arm64 --publish never
+          ls -l dist
+      - name: Collect assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir out
+          find apps/desktop/dist -maxdepth 2 -type f \( \
+            -name "multica-desktop-$version-mac-arm64.dmg" -o \
+            -name "multica-desktop-$version-mac-arm64.dmg.blockmap" -o \
+            -name "multica-desktop-$version-mac-arm64.zip" -o \
+            -name "multica-desktop-$version-mac-arm64.zip.blockmap" -o \
+            -name "latest-mac.yml" -o -name "test-mac.yml" \) -exec cp {} out/ \;
+          test -f "out/multica-desktop-$version-mac-arm64.dmg" || { echo "dmg missing"; ls -l out apps/desktop/dist; exit 1; }
+          test -f "out/multica-desktop-$version-mac-arm64.zip" || { echo "zip missing"; ls -l out; exit 1; }
+          (cd out && shasum -a 256 *.dmg *.zip > SHA256SUMS-mac.txt && cat SHA256SUMS-mac.txt)
+          ls -l out
+      - name: Smoke-test the app (signature, bundled CLI version)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          app=$(find apps/desktop/dist -maxdepth 3 -type d -name "Multica.app" | head -1)
+          [ -n "$app" ] || { echo "Multica.app not found"; find apps/desktop/dist -maxdepth 3 | head -40; exit 1; }
+          codesign -dv "$app" 2>&1 | tee sig.txt
+          cli="$app/Contents/Resources/bin/multica"
+          [ -x "$cli" ] || { echo "bundled CLI missing: $cli"; exit 1; }
+          "$cli" --version | tee version.txt
+          grep -q "$version" version.txt
+          grep -q "commit: $(git rev-parse --short=7 HEAD)" version.txt
+          { echo '```'; cat version.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Create the Release when it is missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rel="mac-$TAG"
+          if gh release view "$rel" -R "${{ github.repository }}" >/dev/null 2>&1; then echo "release $rel exists"; exit 0; fi
+          sha=$(git rev-parse HEAD)
+          gh release create "$rel" -R "${{ github.repository }}" --target "${{ github.sha }}" --latest=false --prerelease \
+            --title "Multica Desktop $TAG (macOS arm64, from $SOURCE)" \
+            --notes "macOS (Apple Silicon) installer for $SOURCE tag $TAG (commit $sha). Ad-hoc signed, not notarized. Install: open the .dmg and drag Multica into Applications (replace when asked). If macOS blocks the first launch, run: xattr -dr com.apple.quarantine /Applications/Multica.app . Verify with: shasum -a 256 -c SHA256SUMS-mac.txt"
+      - name: Upload the assets (large files first, feed metadata last)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rel="mac-$TAG"; repo="${{ github.repository }}"
+          gh release upload "$rel" -R "$repo" --clobber out/*.dmg out/*.zip
+          gh release upload "$rel" -R "$repo" --clobber out/*.blockmap
+          gh release upload "$rel" -R "$repo" --clobber out/SHA256SUMS-mac.txt out/*.yml
+      - name: Verify every asset is uploaded and matches the local build
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/releases/tags/mac-$TAG" --jq '.assets[] | "\(.name)\t\(.state)\t\(.size)\t\(.browser_download_url)"' > remote.tsv
+          fail=0
+          for f in out/*; do
+            name=$(basename "$f"); size=$(stat -f %z "$f")
+            line=$(awk -F'\t' -v n="$name" '$1==n' remote.tsv)
+            if [ -z "$line" ]; then echo "MISSING $name"; fail=1; continue; fi
+            state=$(cut -f2 <<<"$line"); rsize=$(cut -f3 <<<"$line"); url=$(cut -f4 <<<"$line")
+            if [ "$state" != uploaded ] || [ "$rsize" != "$size" ]; then echo "BAD $name state=$state size=$rsize want=$size"; fail=1
+            else echo "ok  $name $size $url" | tee -a "$GITHUB_STEP_SUMMARY"; fi
+          done
+          exit $fail
