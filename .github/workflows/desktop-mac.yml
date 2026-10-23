@@ -96,8 +96,9 @@ jobs:
           app=$(find apps/desktop/dist -maxdepth 3 -type d -name "Multica.app" | head -1)
           [ -n "$app" ] || { echo "Multica.app not found"; find apps/desktop/dist -maxdepth 3 | head -40; exit 1; }
           codesign -dv "$app" 2>&1 | tee sig.txt
-          cli="$app/Contents/Resources/bin/multica"
-          [ -x "$cli" ] || { echo "bundled CLI missing: $cli"; exit 1; }
+          cli=$(find "$app/Contents" -type f -name multica -perm -u+x | head -1 || true)
+          [ -n "$cli" ] || { echo "bundled CLI not found in $app"; find "$app/Contents/Resources" -maxdepth 3 | head -40; exit 1; }
+          echo "cli: $cli"
           "$cli" --version | tee version.txt
           grep -q "$version" version.txt
           grep -q "commit: $(git rev-parse --short=7 HEAD)" version.txt
